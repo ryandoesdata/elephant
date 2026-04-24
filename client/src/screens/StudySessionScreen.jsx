@@ -41,12 +41,17 @@ export default function StudySessionScreen() {
   const { data: session, isLoading, isError } = useSession(pieceId, parsedMovementId);
   const submitReview = useSubmitReview(pieceId);
 
+  const breakSegment = useBreakSegment(pieceId);
+
   const [queue, setQueue] = useState(null);
   const initialized = useRef(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [mergeEvent, setMergeEvent] = useState(null);
   const [splitEvent, setSplitEvent] = useState(null);
   const [ratingSummary, setRatingSummary] = useState([0, 0, 0, 0]);
+  const [breakupSuggestion, setBreakupSuggestion] = useState(null);
+  const struggleCounts = useRef({});
+  const dismissedSegments = useRef(new Set());
 
   // Back destination depends on whether we came from a movement or piece
   const backPath = `/pieces/${pieceId}`;
@@ -64,8 +69,10 @@ export default function StudySessionScreen() {
     if (!currentCard || isSubmitting) return;
     setIsSubmitting(true);
 
+    const card = currentCard;
+
     try {
-      const result = await submitReview.mutateAsync({ cardId: currentCard.cardId, rating });
+      const result = await submitReview.mutateAsync({ cardId: card.cardId, rating });
 
       setRatingSummary((prev) => {
         const next = [...prev];
@@ -83,18 +90,55 @@ export default function StudySessionScreen() {
 
       setQueue((prev) => {
         const rest = prev.slice(1);
-        // If the segment was split, the card is gone — drop it from the queue
         if (result.splitEvent?.occurred) return rest;
-        if (rating === 0) return reinsertAgain(rest, currentCard);
-        if (rating === 1) return reinsert(rest, currentCard, HARD_REINSERT_OFFSET);
+        if (rating === 0) return reinsertAgain(rest, card);
+        if (rating === 1) return reinsert(rest, card, HARD_REINSERT_OFFSET);
         return rest;
       });
+
+      // Suggest breaking up segments the user keeps struggling on
+      if (rating <= 1 && !result.splitEvent?.occurred) {
+        const { segmentId, measureStart, measureEnd, label } = card;
+        const span = measureEnd - measureStart;
+        if (span > 1 && !dismissedSegments.current.has(segmentId)) {
+          struggleCounts.current[segmentId] = (struggleCounts.current[segmentId] ?? 0) + 1;
+          if (struggleCounts.current[segmentId] >= STRUGGLE_THRESHOLD) {
+            const splitAfter = measureStart + Math.floor(span / 2);
+            setBreakupSuggestion({
+              show: true,
+              segmentId,
+              midPoint: splitAfter + 1,
+              cardLabel: label,
+              newLabels: [
+                `Measures ${measureStart}–${splitAfter}`,
+                `Measures ${splitAfter}–${measureEnd}`,
+              ],
+            });
+            struggleCounts.current[segmentId] = 0;
+          }
+        }
+      }
     } catch (err) {
       console.error('Failed to submit review:', err);
     } finally {
       setIsSubmitting(false);
     }
   }, [currentCard, isSubmitting, submitReview]);
+
+  const handleBreakup = useCallback(async () => {
+    if (!breakupSuggestion) return;
+    const { segmentId, midPoint } = breakupSuggestion;
+    await breakSegment.mutateAsync({ segmentId, midPoint });
+    setQueue((prev) => prev.filter((c) => c.segmentId !== segmentId));
+    dismissedSegments.current.add(segmentId);
+    setBreakupSuggestion(null);
+  }, [breakupSuggestion, breakSegment]);
+
+  const handleDismissBreakup = useCallback(() => {
+    if (!breakupSuggestion) return;
+    dismissedSegments.current.add(breakupSuggestion.segmentId);
+    setBreakupSuggestion(null);
+  }, [breakupSuggestion]);
 
   if (isLoading || queue === null) {
     return <div className="screen-loading">Loading session…</div>;
@@ -147,6 +191,12 @@ export default function StudySessionScreen() {
       <SplitNotification
         splitEvent={splitEvent}
         onDismiss={() => setSplitEvent(null)}
+      />
+      <BreakupSuggestion
+        suggestion={breakupSuggestion}
+        onBreakup={handleBreakup}
+        onDismiss={handleDismissBreakup}
+        isBreaking={breakSegment.isPending}
       />
     </div>
   );
